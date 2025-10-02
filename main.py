@@ -70,6 +70,7 @@ class TradingConfig:
     laplacian_tau: float = 0.5
     laplacian_k: int = 5
     persist_backtest_artifacts: bool = False
+    backtest_artifacts_root: str = "runs"
 
 
 @dataclass
@@ -2135,10 +2136,12 @@ class Backtester:
         else:
             sharpe = float(returns.mean() / (returns.std() + 1e-12) * math.sqrt(252))
         drawdown = float((curve / curve.cummax() - 1.0).min()) if not curve.empty else float("nan")
-        persist = getattr(getattr(bot, "config", None), "persist_backtest_artifacts", False)
+        config = getattr(bot, "config", None)
+        persist = getattr(config, "persist_backtest_artifacts", False)
         output_dir: Optional[Path] = None
         if persist:
-            output_dir = Path("runs") / pd.Timestamp.utcnow().strftime("backtest_%Y%m%d%H%M%S")
+            artifact_root = getattr(config, "backtest_artifacts_root", "runs")
+            output_dir = Path(artifact_root) / pd.Timestamp.utcnow().strftime("backtest_%Y%m%d%H%M%S")
             output_dir.mkdir(parents=True, exist_ok=True)
             curve.to_csv(output_dir / "equity.csv", header=["equity"])
         weights_records = [
@@ -2877,21 +2880,44 @@ def format_summary(summary: Dict[str, object]) -> str:
 
 
 def _parse_date(date_str: Optional[str]) -> Optional[dt.date]:
-    """Parse a string into a date if provided."""
+    """Parse a string into a date if provided, failing fast on invalid input."""
 
     if not date_str:
         return None
-    return pd.to_datetime(date_str).date()
+    try:
+        return pd.to_datetime(date_str, errors="raise").date()
+    except Exception as exc:
+        raise SystemExit(f"Invalid date '{date_str}': {exc}")
+
+
+def _parse_symbols_arg(arg: str) -> List[str]:
+    """Parse comma/space separated symbols, preserving order and deduplicating."""
+
+    tokens = [token.strip().upper() for token in re.split(r"[\s,]+", arg or "") if token.strip()]
+    seen = set()
+    ordered: List[str] = []
+    for token in tokens:
+        if token not in seen:
+            ordered.append(token)
+            seen.add(token)
+    if not ordered:
+        raise SystemExit("No valid symbols were provided.")
+    return ordered[:64]
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Trading bot entrypoint")
-    parser.add_argument("--symbols", default="AAPL,TSLA,XLF", help="Comma-separated list of tickers")
+    defaults = TradingConfig()
+    parser = argparse.ArgumentParser(
+        description="Trading bot entrypoint",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--symbols", default="AAPL,TSLA,XLF", help="Comma/space-separated list of tickers")
     parser.add_argument("--start", type=str, help="Start date (YYYY-MM-DD)")
     parser.add_argument("--end", type=str, help="End date (YYYY-MM-DD)")
     parser.add_argument("--years", type=int, default=1, help="Years of history if --start not supplied")
     parser.add_argument("--offline", action="store_true", help="Use synthetic offline data sources")
-    parser.add_argument("--persist", action="store_true", help="Persist backtest artefacts under ./runs")
+    parser.add_argument("--persist", action="store_true", help="Persist backtest artefacts")
+    parser.add_argument("--persist-dir", type=str, default=defaults.backtest_artifacts_root, help="Root folder for artefacts when --persist is set")
     parser.add_argument("--backtest", action="store_true", help="Run a full backtest instead of single evaluation")
     parser.add_argument(
         "--log-level",
@@ -2899,6 +2925,11 @@ def main() -> None:
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="Logging level for stdout",
     )
+    parser.add_argument("--seed", type=int, default=defaults.random_seed, help="Random seed for reproducibility")
+    parser.add_argument("--initial-cash", type=float, default=defaults.initial_cash, help="Starting portfolio cash")
+    parser.add_argument("--model-type", choices=["logistic", "neural"], default=defaults.model_type, help="Prediction model type")
+    parser.add_argument("--no-calibration", action="store_true", help="Disable probability calibration for logistic model")
+    parser.add_argument("--json-out", type=str, help="Write JSON output to this path")
     args = parser.parse_args()
 
     if not logging.getLogger().handlers:
@@ -2909,9 +2940,22 @@ def main() -> None:
 
     end_date = _parse_date(args.end) or dt.date.today()
     start_date = _parse_date(args.start) or (end_date - dt.timedelta(days=365 * args.years))
-    symbols = [token.strip().upper() for token in args.symbols.split(",") if token.strip()]
+    if start_date > end_date:
+        raise SystemExit(f"--start {start_date} must be on or before --end {end_date}")
+    if start_date == end_date:
+        start_date = end_date - dt.timedelta(days=30)
+        logger.info("adjusted_start_date start=%s end=%s", start_date, end_date)
+    symbols = _parse_symbols_arg(args.symbols)
 
-    config = TradingConfig(offline_mode=args.offline, persist_backtest_artifacts=args.persist)
+    config = TradingConfig(
+        offline_mode=args.offline,
+        persist_backtest_artifacts=args.persist,
+        backtest_artifacts_root=args.persist_dir,
+        random_seed=args.seed,
+        initial_cash=args.initial_cash,
+        model_type=args.model_type,
+        use_calibration=not args.no_calibration,
+    )
     bot = TradingBot(config=config)
 
     if args.backtest:
@@ -2928,6 +2972,18 @@ def main() -> None:
         artifact_path = results.get("artifact_path")
         if artifact_path:
             logger.info("backtest_artifacts path=%s", artifact_path)
+        if args.json_out:
+            payload = {
+                "symbols": symbols,
+                "start": str(start_date),
+                "end": str(end_date),
+                "sharpe": results.get("sharpe"),
+                "max_drawdown": results.get("max_drawdown"),
+                "artifact_path": str(artifact_path) if artifact_path else None,
+            }
+            output_path = Path(args.json_out)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(json.dumps(payload, indent=2))
         return
 
     analyses: List[Analysis] = []
@@ -2989,7 +3045,12 @@ def main() -> None:
                 decision.macro_environment.consumer_mood,
                 descriptors,
             )
-    print(format_summary(bot.summary()))
+    summary = bot.summary()
+    if args.json_out:
+        output_path = Path(args.json_out)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(summary, indent=2, default=str))
+    print(format_summary(summary))
 
 
 if __name__ == "__main__":
