@@ -57,6 +57,11 @@ class MacroSnapshot:
     manufacturing_pmi: float
     credit_spread: float
     usd_trend: float
+    commodity_trend: float
+    financial_conditions_index: float
+    housing_starts_growth: float
+    consumer_sentiment_index: float
+    global_growth_diff: float
 
 
 @dataclass
@@ -68,6 +73,10 @@ class MacroEnvironment:
     policy_tightening_probability: float
     risk_appetite: float
     stagflation_risk: float
+    commodity_pressure: float
+    liquidity_score: float
+    housing_cycle_strength: float
+    consumer_mood: float
     descriptors: List[str] = field(default_factory=list)
 
 
@@ -177,6 +186,15 @@ class DataFetcher:
         manufacturing_pmi = 52 + 3 * math.sin(as_of.timetuple().tm_yday / 37.0) + rng.normal(0, 0.5)
         credit_spread = 0.015 + 0.01 * math.cos(as_of.timetuple().tm_yday / 67.0) + rng.normal(0, 0.002)
         usd_trend = rng.normal(0, 0.5)
+        commodity_trend = rng.normal(0.0, 0.08) + 0.05 * math.sin(as_of.timetuple().tm_yday / 27.0)
+        financial_conditions_index = (
+            -0.5
+            + 0.4 * math.sin(as_of.timetuple().tm_yday / 31.0)
+            + rng.normal(0.0, 0.15)
+        )
+        housing_starts_growth = 0.03 + 0.01 * math.cos(as_of.timetuple().tm_yday / 83.0) + rng.normal(0, 0.003)
+        consumer_sentiment_index = 92 + 5 * math.sin(as_of.timetuple().tm_yday / 41.0) + rng.normal(0, 1.5)
+        global_growth_diff = 0.01 + 0.01 * math.sin(as_of.timetuple().tm_yday / 59.0 + 0.5) + rng.normal(0, 0.003)
         return MacroSnapshot(
             gdp_growth=float(gdp_growth),
             inflation=float(inflation),
@@ -185,6 +203,11 @@ class DataFetcher:
             manufacturing_pmi=float(manufacturing_pmi),
             credit_spread=float(max(credit_spread, 0.005)),
             usd_trend=float(usd_trend),
+            commodity_trend=float(commodity_trend),
+            financial_conditions_index=float(financial_conditions_index),
+            housing_starts_growth=float(housing_starts_growth),
+            consumer_sentiment_index=float(consumer_sentiment_index),
+            global_growth_diff=float(global_growth_diff),
         )
 
 
@@ -268,7 +291,7 @@ class MacroAnalyzer:
         )
 
         credit_relief = np.tanh((0.02 - snapshot.credit_spread) * 120)
-        risk_signal = 0.5 * growth_score - 0.4 * inflation_score + 0.4 * credit_relief - 0.2 * np.tanh(
+        risk_signal = 0.45 * growth_score - 0.35 * inflation_score + 0.35 * credit_relief - 0.2 * np.tanh(
             snapshot.usd_trend / 2.0
         )
         risk_appetite = float(np.tanh(risk_signal))
@@ -278,6 +301,27 @@ class MacroAnalyzer:
             + 0.3 * np.tanh((snapshot.credit_spread - 0.02) * 120)
         )
         stagflation_risk = float(np.clip(0.5 + 0.5 * stagflation_raw, 0.0, 1.0))
+
+        commodity_pressure = float(
+            np.tanh(0.6 * snapshot.commodity_trend + 0.4 * (snapshot.inflation - 0.025) * 80)
+        )
+        liquidity_score = float(
+            np.tanh(
+                -0.5 * snapshot.credit_spread * 120
+                + 0.4 * snapshot.yield_curve_slope * 100
+                - 0.3 * snapshot.financial_conditions_index
+            )
+        )
+        housing_cycle_strength = float(
+            np.tanh(0.7 * snapshot.housing_starts_growth * 50 - 0.4 * (snapshot.unemployment - 0.04) * 120)
+        )
+        consumer_mood = float(
+            np.tanh(
+                0.05 * (snapshot.consumer_sentiment_index - 90)
+                - 0.4 * (snapshot.unemployment - 0.045) * 100
+            )
+        )
+        global_growth_bias = np.tanh(snapshot.global_growth_diff * 120)
 
         descriptors: List[str] = []
         if growth_score > 0.35:
@@ -294,6 +338,26 @@ class MacroAnalyzer:
             descriptors.append("risk-off sentiment")
         if stagflation_risk > 0.6:
             descriptors.append("stagflation watch")
+        if commodity_pressure > 0.45:
+            descriptors.append("commodity squeeze")
+        elif commodity_pressure < -0.45:
+            descriptors.append("commodity relief")
+        if liquidity_score < -0.4:
+            descriptors.append("tight liquidity")
+        elif liquidity_score > 0.4:
+            descriptors.append("ample liquidity")
+        if housing_cycle_strength > 0.35:
+            descriptors.append("housing upswing")
+        elif housing_cycle_strength < -0.35:
+            descriptors.append("housing slowdown")
+        if consumer_mood < -0.4:
+            descriptors.append("weak consumer sentiment")
+        elif consumer_mood > 0.4:
+            descriptors.append("confident consumer")
+        if global_growth_bias < -0.4:
+            descriptors.append("global growth drag")
+        elif global_growth_bias > 0.4:
+            descriptors.append("global growth tailwind")
 
         return MacroEnvironment(
             growth_score=growth_score,
@@ -301,6 +365,10 @@ class MacroAnalyzer:
             policy_tightening_probability=policy_tightening_probability,
             risk_appetite=risk_appetite,
             stagflation_risk=stagflation_risk,
+            commodity_pressure=commodity_pressure,
+            liquidity_score=liquidity_score,
+            housing_cycle_strength=housing_cycle_strength,
+            consumer_mood=consumer_mood,
             descriptors=descriptors,
         )
 
@@ -308,12 +376,13 @@ class MacroAnalyzer:
 class QuantStrategy:
     """Generates long/short signals using price action, macro, and news sentiment."""
 
-    def __init__(self, momentum_window: int = 21, volatility_window: int = 63, value_window: int = 252):
+    def __init__(self, momentum_window: int = 21, volatility_window: int = 63, value_window: int = 252, volatility_target: float = 0.15):
         self.momentum_window = momentum_window
         self.volatility_window = volatility_window
         self.value_window = value_window
         self.base_leverage = 1.0
         self.max_leverage = 3.0
+        self.volatility_target = volatility_target
 
     def generate_signals(
         self,
@@ -331,10 +400,14 @@ class QuantStrategy:
         macro_bias = sentiment.macro * (0.5 + 0.5 * sentiment.macro_confidence)
         industry_bias = sentiment.industry * (0.5 + 0.5 * sentiment.industry_confidence)
         macro_cycle_bias = (
-            0.45 * macro_environment.growth_score
+            0.4 * macro_environment.growth_score
             - 0.35 * macro_environment.inflation_score
             + 0.25 * macro_environment.risk_appetite
             - 0.2 * macro_environment.stagflation_risk
+            - 0.15 * macro_environment.commodity_pressure
+            + 0.2 * macro_environment.liquidity_score
+            + 0.15 * macro_environment.housing_cycle_strength
+            + 0.2 * macro_environment.consumer_mood
         )
         raw_signal = (
             0.6 * momentum
@@ -344,11 +417,19 @@ class QuantStrategy:
             + 0.3 * industry_bias
             + 0.35 * macro_cycle_bias
         )
-        target_weight = np.tanh(raw_signal)
+        raw_weight = pd.Series(np.tanh(raw_signal.values), index=raw_signal.index)
+        annual_vol = (volatility * math.sqrt(252)).clip(lower=1e-6)
+        vol_scaler = (self.volatility_target / annual_vol).clip(lower=0.25, upper=3.0)
+        target_weight = (raw_weight * vol_scaler).clip(lower=-1.5, upper=1.5)
         news_confidence = max(sentiment.macro_confidence, sentiment.industry_confidence)
-        macro_risk_adjustment = 0.5 * macro_environment.risk_appetite - 0.4 * macro_environment.stagflation_risk
+        macro_risk_adjustment = (
+            0.45 * macro_environment.risk_appetite
+            - 0.35 * macro_environment.stagflation_risk
+            + 0.25 * macro_environment.liquidity_score
+            - 0.2 * max(macro_environment.commodity_pressure, 0.0)
+        )
         leverage_signal = self.base_leverage + news_confidence + macro_risk_adjustment
-        inflation_penalty = 0.3 * max(macro_environment.inflation_score, 0.0)
+        inflation_penalty = 0.25 * max(macro_environment.inflation_score, 0.0)
         target_leverage = np.clip(leverage_signal - inflation_penalty, 1.0, self.max_leverage)
 
         return pd.DataFrame(
@@ -358,6 +439,7 @@ class QuantStrategy:
                 "momentum": momentum,
                 "volatility": volatility,
                 "value": value_signal,
+                "volatility_target_multiplier": vol_scaler,
             },
             index=prices.index,
         )
@@ -369,6 +451,8 @@ class Portfolio:
     def __init__(self, cash: float = 1_000_000.0):
         self.cash = cash
         self.positions: Dict[str, Position] = {}
+        self.realized_pnl: float = 0.0
+        self.total_borrow_cost: float = 0.0
 
     def update_position(self, symbol: str, target_quantity: float, price: float, leverage: float) -> None:
         current = self.positions.get(symbol)
@@ -376,6 +460,18 @@ class Portfolio:
         trade_qty = target_quantity - current_qty
         trade_value = trade_qty * price
         self.cash -= trade_value
+
+        if current:
+            realized_qty = 0.0
+            if math.isclose(target_quantity, 0.0, abs_tol=1e-9):
+                realized_qty = current_qty
+            elif math.copysign(1.0, current_qty or 1.0) != math.copysign(1.0, target_quantity or 1.0):
+                realized_qty = current_qty
+            elif abs(target_quantity) < abs(current_qty):
+                realized_qty = current_qty - target_quantity
+            if not math.isclose(realized_qty, 0.0, abs_tol=1e-12):
+                pnl_contribution = realized_qty * (price - current.avg_price)
+                self.realized_pnl += pnl_contribution
 
         if math.isclose(target_quantity, 0.0, abs_tol=1e-9):
             if symbol in self.positions:
@@ -421,6 +517,7 @@ class Portfolio:
         interest = debt * borrowing_rate * (days / 365.0)
         if interest > 0:
             self.cash -= interest
+            self.total_borrow_cost += interest
         return interest
 
     def summary(self, price_lookup: Dict[str, float]) -> Dict[str, object]:
@@ -447,6 +544,8 @@ class Portfolio:
             "equity": self.total_equity(price_lookup),
             "gross_exposure": self.total_exposure(price_lookup),
             "leverage": self.leverage(price_lookup),
+            "realized_pnl": self.realized_pnl,
+            "borrow_cost": self.total_borrow_cost,
             "positions": positions_summary,
         }
 
@@ -488,8 +587,17 @@ class RiskManager:
         adjusted_weight = float(np.clip(target_weight, -max_weight, max_weight))
         leverage = min(target_leverage, self.max_leverage)
         desired_notional = equity * adjusted_weight * leverage
-        max_notional = equity * self.max_leverage * self.position_limit
-        desired_notional = float(np.clip(desired_notional, -max_notional, max_notional))
+        current_position = portfolio.positions.get(symbol)
+        current_notional = abs(current_position.quantity * price) if current_position else 0.0
+        max_position_notional = equity * self.max_leverage * self.position_limit
+        desired_notional = float(np.clip(desired_notional, -max_position_notional, max_position_notional))
+
+        total_exposure = portfolio.total_exposure(price_lookup)
+        exposure_excluding_symbol = total_exposure - current_notional
+        max_portfolio_exposure = equity * self.max_leverage
+        available_capacity = max(max_portfolio_exposure - exposure_excluding_symbol, 0.0)
+        desired_abs = min(abs(desired_notional), available_capacity)
+        desired_notional = math.copysign(desired_abs, desired_notional)
         return desired_notional / price
 
 
@@ -503,6 +611,7 @@ class TradeDecision:
     leverage_cost: float
     sentiment: SentimentProfile = field(default_factory=SentimentProfile)
     macro_environment: Optional[MacroEnvironment] = None
+    indicators: Dict[str, float] = field(default_factory=dict)
 
 
 class TradingBot:
@@ -562,6 +671,12 @@ class TradingBot:
             leverage_cost=leverage_cost,
             sentiment=sentiment,
             macro_environment=macro_environment,
+            indicators={
+                "momentum": float(latest_row["momentum"]),
+                "volatility": float(latest_row["volatility"]),
+                "value": float(latest_row["value"]),
+                "volatility_target_multiplier": float(latest_row["volatility_target_multiplier"]),
+            },
         )
 
     def summary(self) -> Dict[str, object]:
@@ -575,6 +690,8 @@ def format_summary(summary: Dict[str, object]) -> str:
         f"  Equity: ${summary['equity']:.2f}",
         f"  Gross Exposure: ${summary['gross_exposure']:.2f}",
         f"  Leverage: {summary['leverage']:.2f}x",
+        f"  Realized PnL: ${summary['realized_pnl']:.2f}",
+        f"  Borrow Cost Paid: ${summary['borrow_cost']:.2f}",
         "  Positions:",
     ]
     positions = summary.get("positions", [])
@@ -610,6 +727,13 @@ def main() -> None:
             decision.leverage_cost,
         )
         logging.info(
+            "Signal context - Momentum: %.2f | Volatility: %.4f | Value: %.2f | Vol Target Multiplier: %.2f",
+            decision.indicators.get("momentum", float("nan")),
+            decision.indicators.get("volatility", float("nan")),
+            decision.indicators.get("value", float("nan")),
+            decision.indicators.get("volatility_target_multiplier", float("nan")),
+        )
+        logging.info(
             "Sentiment - Macro: %.2f (confidence %.2f), Industry: %.2f (confidence %.2f)",
             decision.sentiment.macro,
             decision.sentiment.macro_confidence,
@@ -625,6 +749,13 @@ def main() -> None:
             decision.macro_environment.risk_appetite if decision.macro_environment else float("nan"),
             decision.macro_environment.stagflation_risk if decision.macro_environment else float("nan"),
             f"| Tags: {descriptors}" if descriptors else "",
+        )
+        logging.info(
+            "Macro extensions - Commodity Pressure: %.2f | Liquidity: %.2f | Housing Cycle: %.2f | Consumer Mood: %.2f",
+            decision.macro_environment.commodity_pressure if decision.macro_environment else float("nan"),
+            decision.macro_environment.liquidity_score if decision.macro_environment else float("nan"),
+            decision.macro_environment.housing_cycle_strength if decision.macro_environment else float("nan"),
+            decision.macro_environment.consumer_mood if decision.macro_environment else float("nan"),
         )
 
     summary = bot.summary()
