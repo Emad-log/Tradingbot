@@ -683,7 +683,20 @@ class DataFetcher:
         self.random_seed = random_seed
         self.offline = offline
         self.session = requests.Session()
-        retries = Retry(total=3, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504), allowed_methods=("GET",))
+        try:
+            retries = Retry(
+                total=3,
+                backoff_factor=0.5,
+                status_forcelist=(429, 500, 502, 503, 504),
+                allowed_methods={"GET"},
+            )
+        except TypeError:  # pragma: no cover - urllib3<1.26 compatibility
+            retries = Retry(
+                total=3,
+                backoff_factor=0.5,
+                status_forcelist=(429, 500, 502, 503, 504),
+                method_whitelist={"GET"},
+            )
         adapter = HTTPAdapter(max_retries=retries)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
@@ -739,16 +752,23 @@ class DataFetcher:
             frame = pd.read_csv(io.StringIO(response.text))
             if frame.empty or "Data" not in frame:
                 raise ValueError("Empty Stooq response")
-            frame = frame.rename(
-                columns={
-                    "Data": "date",
-                    "Otwarcie": "open",
-                    "Najwyzszy": "high",
-                    "Najnizszy": "low",
-                    "Zamkniecie": "close",
-                    "Wolumen": "volume",
-                }
-            )
+            colmap = {
+                "Data": "date",
+                "Date": "date",
+                "Otwarcie": "open",
+                "Open": "open",
+                "Najwyzszy": "high",
+                "High": "high",
+                "Najnizszy": "low",
+                "Low": "low",
+                "Zamkniecie": "close",
+                "Close": "close",
+                "Wolumen": "volume",
+                "Volume": "volume",
+            }
+            frame = frame.rename(columns=colmap)
+            if "date" not in frame.columns or "close" not in frame.columns:
+                raise ValueError("Unexpected Stooq response columns")
             frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
             frame = frame.dropna(subset=["date"])
             numeric_cols = ["open", "high", "low", "close", "volume"]
