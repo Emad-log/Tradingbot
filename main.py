@@ -1,6 +1,7 @@
 """Trading bot prototype with quantitative, news-aware decision making."""
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import hashlib
 import io
@@ -2875,19 +2876,66 @@ def format_summary(summary: Dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def _parse_date(date_str: Optional[str]) -> Optional[dt.date]:
+    """Parse a string into a date if provided."""
+
+    if not date_str:
+        return None
+    return pd.to_datetime(date_str).date()
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Trading bot entrypoint")
+    parser.add_argument("--symbols", default="AAPL,TSLA,XLF", help="Comma-separated list of tickers")
+    parser.add_argument("--start", type=str, help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end", type=str, help="End date (YYYY-MM-DD)")
+    parser.add_argument("--years", type=int, default=1, help="Years of history if --start not supplied")
+    parser.add_argument("--offline", action="store_true", help="Use synthetic offline data sources")
+    parser.add_argument("--persist", action="store_true", help="Persist backtest artefacts under ./runs")
+    parser.add_argument("--backtest", action="store_true", help="Run a full backtest instead of single evaluation")
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Logging level for stdout",
+    )
+    args = parser.parse_args()
+
     if not logging.getLogger().handlers:
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s [%(levelname)s] %(message)s")
-    today = dt.date.today()
-    start = today - dt.timedelta(days=365)
-    symbols = ["AAPL", "TSLA", "XLF"]
-    bot = TradingBot()
-    analyses = []
+        logging.basicConfig(
+            level=getattr(logging, args.log_level.upper(), logging.INFO),
+            format="%(asctime)s %(name)s [%(levelname)s] %(message)s",
+        )
+
+    end_date = _parse_date(args.end) or dt.date.today()
+    start_date = _parse_date(args.start) or (end_date - dt.timedelta(days=365 * args.years))
+    symbols = [token.strip().upper() for token in args.symbols.split(",") if token.strip()]
+
+    config = TradingConfig(offline_mode=args.offline, persist_backtest_artifacts=args.persist)
+    bot = TradingBot(config=config)
+
+    if args.backtest:
+        logger.info(
+            "running_backtest symbols=%s start=%s end=%s offline=%s", symbols, start_date, end_date, args.offline
+        )
+        results = Backtester().run(bot, symbols, start_date, end_date)
+        logger.info(
+            "backtest_result sharpe=%.3f max_drawdown=%.2f%% final_equity=%s",
+            results.get("sharpe", float("nan")),
+            100 * results.get("max_drawdown", float("nan")),
+            ("$%.2f" % results["equity"].iloc[-1]) if not results.get("equity", pd.Series(dtype=float)).empty else "n/a",
+        )
+        artifact_path = results.get("artifact_path")
+        if artifact_path:
+            logger.info("backtest_artifacts path=%s", artifact_path)
+        return
+
+    analyses: List[Analysis] = []
     for symbol in symbols:
-        logger.info("evaluating_trades symbol=%s start=%s end=%s", symbol, start, today)
-        analyses.append(bot.analyze(symbol, start, today))
+        logger.info("evaluating_trades symbol=%s start=%s end=%s", symbol, start_date, end_date)
+        analyses.append(bot.analyze(symbol, start_date, end_date))
     decisions_map = bot.execute(analyses)
-    bot.end_of_day(pd.Timestamp(today))
+    bot.end_of_day(pd.Timestamp(end_date))
 
     for symbol in symbols:
         decision = decisions_map.get(symbol)
@@ -2941,9 +2989,7 @@ def main() -> None:
                 decision.macro_environment.consumer_mood,
                 descriptors,
             )
-
-    summary = bot.summary()
-    print(format_summary(summary))
+    print(format_summary(bot.summary()))
 
 
 if __name__ == "__main__":
