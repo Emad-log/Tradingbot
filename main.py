@@ -72,6 +72,7 @@ class TradingConfig:
     persist_backtest_artifacts: bool = False
     backtest_artifacts_root: str = "runs"
     fast_backtest: bool = False
+    signal_threshold: float = 0.05
 
 
 @dataclass
@@ -1348,15 +1349,15 @@ class MacroAnalyzer:
             )
         )
 
-        credit_relief = np.tanh((0.02 - snapshot.credit_spread) * 120)
+        credit_relief = np.tanh((0.04 - snapshot.credit_spread) * 60)
         risk_signal = 0.45 * growth_score - 0.35 * inflation_score + 0.35 * credit_relief - 0.2 * np.tanh(
             snapshot.usd_trend / 2.0
         )
         risk_appetite = float(np.tanh(risk_signal))
 
         stagflation_raw = (
-            0.4 * (inflation_score - growth_score)
-            + 0.3 * np.tanh((snapshot.credit_spread - 0.02) * 120)
+            0.35 * (inflation_score - growth_score)
+            + 0.25 * np.tanh((snapshot.credit_spread - 0.04) * 60)
         )
         stagflation_risk = float(np.clip(0.5 + 0.5 * stagflation_raw, 0.0, 1.0))
 
@@ -1365,9 +1366,9 @@ class MacroAnalyzer:
         )
         liquidity_score = float(
             np.tanh(
-                -0.5 * snapshot.credit_spread * 120
+                -0.4 * (snapshot.credit_spread - 0.04) * 80
                 + 0.4 * snapshot.yield_curve_slope * 100
-                - 0.3 * snapshot.financial_conditions_index
+                - 0.25 * snapshot.financial_conditions_index
             )
         )
         housing_cycle_strength = float(
@@ -1444,6 +1445,7 @@ class QuantStrategy:
         base_leverage: float = 1.0,
         trade_band: float = 0.05,
         min_notional: float = 5_000.0,
+        signal_threshold: float = 0.05,
     ):
         self.momentum_window = momentum_window
         self.volatility_window = volatility_window
@@ -1453,6 +1455,7 @@ class QuantStrategy:
         self.volatility_target = volatility_target
         self.trade_band = trade_band
         self.min_notional = min_notional
+        self.signal_threshold = signal_threshold
 
     def generate_signals(
         self,
@@ -1480,7 +1483,8 @@ class QuantStrategy:
             + 0.15 * macro_environment.housing_cycle_strength
             + 0.2 * macro_environment.consumer_mood
         )
-        macro_cycle_bias = pd.Series(macro_cycle_bias_value, index=prices.index)
+        macro_cycle_bias_scale = 0.5 + 0.5 * abs(macro_environment.risk_appetite)
+        macro_cycle_bias = pd.Series(macro_cycle_bias_value * macro_cycle_bias_scale, index=prices.index)
         ml_signal = pd.Series(0.0, index=prices.index)
         if learned_signal is not None and not learned_signal.empty:
             ml_signal = learned_signal.reindex(prices.index).ffill().fillna(0.0)
@@ -1488,14 +1492,17 @@ class QuantStrategy:
 
         raw_signal = (
             0.6 * momentum
-            - 0.3 * volatility
-            + 0.2 * value_signal
-            + 0.4 * macro_bias
-            + 0.3 * industry_bias
-            + 0.35 * macro_cycle_bias
-            + 0.5 * ml_signal
+            - 0.25 * volatility
+            + 0.25 * value_signal
+            + 0.2 * macro_bias
+            + 0.2 * industry_bias
+            + 0.2 * macro_cycle_bias
+            + 0.4 * ml_signal
         )
-        raw_weight = pd.Series(np.tanh(raw_signal.values), index=raw_signal.index)
+        raw_signal_smoothed = raw_signal.ewm(span=5, adjust=False).mean()
+        raw_weight = pd.Series(np.tanh(raw_signal_smoothed.values), index=raw_signal.index)
+        if self.signal_threshold > 0:
+            raw_weight = raw_weight.where(raw_weight.abs() >= self.signal_threshold, 0.0)
         annual_vol = (volatility * math.sqrt(252)).clip(lower=1e-6)
         vol_scaler = (self.volatility_target / annual_vol).clip(lower=0.25, upper=3.0)
         target_weight = (raw_weight * vol_scaler).clip(lower=-1.5, upper=1.5)
@@ -2226,6 +2233,8 @@ class Backtester:
         if fast_mode and len(dates) > 0:
             monthly = pd.DatetimeIndex(sorted({dates[0], dates[-1], *dates[dates.is_month_start]}))
             dates = monthly
+        if hasattr(bot, "reset_diagnostics"):
+            bot.reset_diagnostics()
         equity_points: List[Tuple[pd.Timestamp, float]] = []
         weights_history: List[Tuple[pd.Timestamp, Dict[str, float]]] = []
         for current_date in dates:
@@ -2280,6 +2289,18 @@ class Backtester:
         weights_df = pd.DataFrame.from_records(weights_records).set_index("date") if weights_records else pd.DataFrame()
         if persist and output_dir is not None and not weights_df.empty:
             weights_df.to_csv(output_dir / "weights.csv")
+        trade_records = getattr(bot, "trade_log", [])
+        trade_df = pd.DataFrame(trade_records)
+        if persist and output_dir is not None and not trade_df.empty:
+            trade_df.to_csv(output_dir / "trades.csv", index=False)
+        optimizer_records = getattr(bot, "optimizer_log", [])
+        optimizer_df = pd.DataFrame(optimizer_records)
+        if persist and output_dir is not None and not optimizer_df.empty:
+            optimizer_df.to_csv(output_dir / "optimizer.csv", index=False)
+        summary_records = getattr(bot, "daily_summary_log", [])
+        summary_df = pd.DataFrame(summary_records)
+        if persist and output_dir is not None and not summary_df.empty:
+            summary_df.to_csv(output_dir / "portfolio_daily.csv", index=False)
         turnover_series = weights_df.diff().abs().sum(axis=1) if not weights_df.empty else pd.Series(dtype=float)
         avg_turnover = float(turnover_series.mean()) if not turnover_series.empty else float("nan")
         if persist and output_dir is not None:
@@ -2301,6 +2322,10 @@ class Backtester:
             "artifact_path": output_dir,
             "start": adjusted_start,
             "total_return": total_return,
+            "average_turnover": avg_turnover,
+            "trades": trade_df,
+            "optimizer": optimizer_df,
+            "portfolio_daily": summary_df,
         }
 
 
@@ -2337,6 +2362,7 @@ class TradingBot:
             base_leverage=self.config.base_leverage,
             trade_band=self.config.trade_band,
             min_notional=self.config.min_notional,
+            signal_threshold=self.config.signal_threshold,
         )
         self.risk_manager = risk_manager or RiskManager(
             max_leverage=self.strategy.max_leverage,
@@ -2361,7 +2387,16 @@ class TradingBot:
         self.alpha_combiner = AlphaCombiner(n_features=6)
         self._prev_alpha_snapshot: Optional[Tuple[pd.Timestamp, List[str], np.ndarray, Dict[str, float], np.ndarray]] = None
         self._ic_history: deque[float] = deque(maxlen=60)
+        self.trade_log: List[Dict[str, object]] = []
+        self.optimizer_log: List[Dict[str, object]] = []
+        self.daily_summary_log: List[Dict[str, object]] = []
         logger.info("run_config %s", vars(self.config))
+
+    def reset_diagnostics(self) -> None:
+        """Clear accumulated trade and optimizer diagnostics."""
+        self.trade_log.clear()
+        self.optimizer_log.clear()
+        self.daily_summary_log.clear()
 
     def _build_price_lookup(
         self,
@@ -2702,6 +2737,23 @@ class TradingBot:
             mu_smoothed = mu_signal
 
         A, b, cluster_matrix = self._constraint_matrix(analyses_sorted, returns_frame, as_of)
+        net_target = 0.0
+        if A.size:
+            macro_env = analyses_sorted[0].macro_environment if analyses_sorted else None
+            if macro_env is not None:
+                net_pref = (
+                    0.35 * macro_env.risk_appetite
+                    + 0.2 * macro_env.liquidity_score
+                    - 0.25 * macro_env.stagflation_risk
+                )
+                net_pref = max(net_pref, 0.0)
+                net_target = float(
+                    np.clip(net_pref, 0.0, 0.6)
+                    * (self.config.gross_leverage_target * 0.4)
+                )
+                if b.size:
+                    b = b.copy()
+                    b[0] = net_target
 
         covariance = (
             estimate_covariance_regime(
@@ -2834,6 +2886,20 @@ class TradingBot:
                     cluster_cap = self.config.gross_leverage_target / max(1, cluster_matrix.shape[1])
                     group_abs = cluster_matrix.T @ np.abs(w_opt)
                     group_utilization = float(np.max(group_abs / (cluster_cap + 1e-12)))
+                diag_entry = {
+                    "date": pd.Timestamp(as_of).normalize(),
+                    "mu_norm": mu_norm,
+                    "constraint_norm": constraint_violation,
+                    "lambda_min": lambda_min,
+                    "condition_number": cond_number,
+                    "ex_ante_risk": ex_ante_risk,
+                    "turnover_l1": turnover,
+                    "gross_exposure": gross_exposure,
+                    "active_boxes": active_boxes,
+                    "group_utilization": group_utilization,
+                    "net_target": net_target,
+                }
+                self.optimizer_log.append(diag_entry)
                 logger.info(
                     "optimizer_diagnostics as_of=%s mu_norm=%.4f constraint_norm=%.4e lambda_min=%.6e cond=%.2f risk=%.6f turnover_l1=%.4f gross=%.4f boxes=%d group_util=%.2f",
                     as_of.date(),
@@ -2858,15 +2924,15 @@ class TradingBot:
                 {k: round(v, 4) for k, v in self.cross_sectional_weights.items()},
             )
 
-        for analysis in analyses_sorted:
+        daily_entries: List[Dict[str, object]] = []
+        for idx, analysis in enumerate(analyses_sorted):
             can_trade = self.risk_manager.can_trade(analysis.symbol, as_of)
             allocated_weight = self.cross_sectional_weights.get(analysis.symbol, analysis.levered_raw)
+            current_position = self.portfolio.positions.get(analysis.symbol)
+            prev_quantity = current_position.quantity if current_position else 0.0
+            prev_weight = float(w_prev[idx]) if idx < len(w_prev) else 0.0
             if not can_trade:
-                target_quantity = (
-                    self.portfolio.positions.get(analysis.symbol).quantity
-                    if analysis.symbol in self.portfolio.positions
-                    else 0.0
-                )
+                target_quantity = prev_quantity
             else:
                 target_quantity = self.risk_manager.size_position(
                     portfolio=self.portfolio,
@@ -2875,15 +2941,93 @@ class TradingBot:
                     target_weight=allocated_weight,
                     target_leverage=1.0,
                 )
+            trade_quantity = target_quantity - prev_quantity
+            trade_notional = trade_quantity * analysis.price
             adv_shares = max(analysis.adv_20, 0.0)
             adv_value = analysis.price * adv_shares if adv_shares > 0 else 0.0
+            sigma_daily = analysis.indicators.get("volatility")
+            est_slip_bps = estimate_slippage_bps(trade_notional, adv_value, sigma_daily)
+            est_slippage = abs(trade_notional) * (est_slip_bps / 10_000.0)
+            est_fees = abs(trade_notional) * (self.portfolio.fee_bps / 10_000.0)
+            daily_return = float("nan")
+            history = (
+                analysis.price_history.get("close")
+                if hasattr(analysis.price_history, "columns") and "close" in analysis.price_history.columns
+                else None
+            )
+            if history is not None and len(history) >= 2:
+                prev_close = history.iloc[-2]
+                if prev_close and not math.isclose(prev_close, 0.0):
+                    daily_return = float(analysis.price / prev_close - 1.0)
+            mu_val = float(mu_signal[idx]) if mu_signal.size else float("nan")
+            mu_smooth_val = float(mu_smoothed[idx]) if mu_smoothed.size else float("nan")
+            mu_pred_val = mu_pred_map.get(analysis.symbol, float("nan")) if mu_pred_map else float("nan")
+            cap_val = float(caps[idx]) if caps.size else float("nan")
+            cap_hit = bool(caps.size and idx < len(caps) and abs(self.cross_sectional_weights.get(analysis.symbol, 0.0)) >= cap_val - 1e-6)
+            descriptor = ""
+            if analysis.macro_environment:
+                descriptor = ",".join(analysis.macro_environment.descriptors)
+            trade_entry = {
+                "date": pd.Timestamp(as_of).normalize(),
+                "symbol": analysis.symbol,
+                "price": float(analysis.price),
+                "can_trade": bool(can_trade),
+                "allocated_weight": float(allocated_weight),
+                "previous_weight": prev_weight,
+                "target_weight": float(self.cross_sectional_weights.get(analysis.symbol, allocated_weight)),
+                "target_quantity": float(target_quantity),
+                "previous_quantity": float(prev_quantity),
+                "trade_quantity": float(trade_quantity),
+                "trade_notional": float(trade_notional),
+                "estimated_fee": float(est_fees),
+                "estimated_slippage": float(est_slippage),
+                "daily_return": daily_return,
+                "mu_signal": mu_val,
+                "mu_smoothed": mu_smooth_val,
+                "mu_prediction": mu_pred_val,
+                "levered_raw": float(analysis.levered_raw),
+                "raw_weight": float(analysis.raw_weight),
+                "target_leverage": float(analysis.target_leverage),
+                "ic_blend_weight": float(weight_pred),
+                "cap": cap_val,
+                "cap_hit": cap_hit,
+                "adv_20": float(analysis.adv_20),
+                "sentiment_macro": float(analysis.sentiment.macro),
+                "sentiment_macro_conf": float(analysis.sentiment.macro_confidence),
+                "sentiment_industry": float(analysis.sentiment.industry),
+                "sentiment_industry_conf": float(analysis.sentiment.industry_confidence),
+                "macro_descriptors": descriptor,
+                "macro_risk_appetite": float(
+                    analysis.macro_environment.risk_appetite
+                )
+                if analysis.macro_environment
+                else float("nan"),
+                "macro_stagflation": float(
+                    analysis.macro_environment.stagflation_risk
+                )
+                if analysis.macro_environment
+                else float("nan"),
+                "macro_liquidity": float(
+                    analysis.macro_environment.liquidity_score
+                )
+                if analysis.macro_environment
+                else float("nan"),
+                "portfolio_net_target": net_target,
+                "momentum": float(analysis.indicators.get("momentum", float("nan"))),
+                "volatility": float(analysis.indicators.get("volatility", float("nan"))),
+                "value_signal": float(analysis.indicators.get("value", float("nan"))),
+                "macro_cycle_bias": float(analysis.indicators.get("macro_cycle_bias", float("nan"))),
+                "ml_signal": float(analysis.indicators.get("ml_signal", float("nan"))),
+            }
+            daily_entries.append(trade_entry)
+            self.trade_log.append(trade_entry)
             self.portfolio.update_position(
                 analysis.symbol,
                 target_quantity,
                 analysis.price,
                 leverage=1.0,
                 adv_value=adv_value,
-                sigma_daily=analysis.indicators.get("volatility"),
+                sigma_daily=sigma_daily,
             )
             position = self.portfolio.positions.get(analysis.symbol)
             if position:
@@ -2932,6 +3076,26 @@ class TradingBot:
         exposure = self.portfolio.total_exposure(price_lookup)
         portfolio_leverage = self.portfolio.leverage(price_lookup)
         realized_vol_value = realized_vol if realized_vol is not None else float("nan")
+        summary_entry = {
+            "date": pd.Timestamp(as_of).normalize(),
+            "equity": float(equity),
+            "exposure": float(exposure),
+            "leverage": float(portfolio_leverage),
+            "realized_vol": realized_vol_value,
+            "cash": float(self.portfolio.cash),
+            "realized_pnl": float(self.portfolio.realized_pnl),
+            "fees_total": float(self.portfolio.total_fees),
+            "borrow_cost": float(self.portfolio.total_borrow_cost),
+        }
+        self.daily_summary_log.append(summary_entry)
+        for entry in daily_entries:
+            entry["portfolio_equity"] = float(equity)
+            entry["portfolio_exposure"] = float(exposure)
+            entry["portfolio_leverage"] = float(portfolio_leverage)
+            entry["portfolio_realized_vol"] = realized_vol_value
+            entry["portfolio_cash"] = float(self.portfolio.cash)
+            entry["portfolio_realized_pnl"] = float(self.portfolio.realized_pnl)
+            entry["portfolio_fees"] = float(self.portfolio.total_fees)
         for decision in decisions.values():
             decision.indicators["portfolio_realized_vol"] = realized_vol_value
             logger.info(
@@ -3108,6 +3272,26 @@ def main() -> None:
             100 * results.get("total_return", float("nan")),
             ("$%.2f" % results["equity"].iloc[-1]) if not results.get("equity", pd.Series(dtype=float)).empty else "n/a",
         )
+        avg_turnover = results.get("average_turnover")
+        if avg_turnover is not None and not math.isnan(avg_turnover):
+            logger.info("average_turnover %.4f", avg_turnover)
+        trade_df = results.get("trades")
+        if isinstance(trade_df, pd.DataFrame) and not trade_df.empty:
+            preview_cols = [
+                "date",
+                "symbol",
+                "previous_weight",
+                "target_weight",
+                "trade_quantity",
+                "daily_return",
+                "mu_smoothed",
+                "momentum",
+                "value_signal",
+                "macro_cycle_bias",
+                "ml_signal",
+            ]
+            available_cols = [c for c in preview_cols if c in trade_df.columns]
+            logger.info("recent_trades\n%s", trade_df.tail(5)[available_cols].to_string(index=False))
         artifact_path = results.get("artifact_path")
         if artifact_path:
             logger.info("backtest_artifacts path=%s", artifact_path)
