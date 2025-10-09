@@ -2070,7 +2070,8 @@ def laplacian_smooth(signal: np.ndarray, corr: np.ndarray, k: int = 5, tau: floa
 def build_cluster_exposures(returns: pd.DataFrame, n_clusters: int) -> Optional[np.ndarray]:
     if returns.empty or returns.shape[1] < 2:
         return None
-    n_clusters = min(n_clusters, returns.shape[1])
+    n_assets = returns.shape[1]
+    n_clusters = min(n_clusters, n_assets)
     if n_clusters < 2:
         return None
     corr = returns.corr().fillna(0.0).abs().values
@@ -2089,7 +2090,13 @@ def build_cluster_exposures(returns: pd.DataFrame, n_clusters: int) -> Optional[
             labels = model.fit_predict(distance)
         except Exception:
             return None
-    exposures = np.eye(n_clusters)[labels]
+    unique, counts = np.unique(labels, return_counts=True)
+    keep_labels = [lbl for lbl, cnt in zip(unique, counts) if cnt > 1]
+    if not keep_labels:
+        return None
+    exposures = np.zeros((n_assets, len(keep_labels)), dtype=float)
+    for col, lbl in enumerate(keep_labels):
+        exposures[:, col] = (labels == lbl).astype(float)
     return exposures
 
 
