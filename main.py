@@ -741,43 +741,64 @@ class DataFetcher:
         self._price_cache[cache_key] = frame.copy()
         return frame
 
-    def _fetch_price_data_from_stooq(self, symbol: str, dates: pd.DatetimeIndex) -> pd.DataFrame:
+    def earliest_trading_day(self, symbol: str) -> Optional[dt.date]:
+        if self.offline:
+            return None
+
+        if self.price_source == "stooq":
+            history = self._load_stooq_history(symbol)
+            if history is not None and not history.empty:
+                return history.index.min().date()
+            return None
+
+        # for custom sources we do not yet expose availability metadata
+        return None
+
+    def _load_stooq_history(self, symbol: str) -> Optional[pd.DataFrame]:
         suffix = "" if "." in symbol else ".us"
         stooq_symbol = f"{symbol.lower()}{suffix}"
         if stooq_symbol in self._raw_stooq_cache:
-            full_history = self._raw_stooq_cache[stooq_symbol]
-        else:
-            response = self.session.get(self.STOOQ_URL, params={"s": stooq_symbol, "i": "d"}, timeout=10)
-            response.raise_for_status()
-            frame = pd.read_csv(io.StringIO(response.text))
-            if frame.empty or "Data" not in frame:
-                raise ValueError("Empty Stooq response")
-            colmap = {
-                "Data": "date",
-                "Date": "date",
-                "Otwarcie": "open",
-                "Open": "open",
-                "Najwyzszy": "high",
-                "High": "high",
-                "Najnizszy": "low",
-                "Low": "low",
-                "Zamkniecie": "close",
-                "Close": "close",
-                "Wolumen": "volume",
-                "Volume": "volume",
-            }
-            frame = frame.rename(columns=colmap)
-            if "date" not in frame.columns or "close" not in frame.columns:
-                raise ValueError("Unexpected Stooq response columns")
-            frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
-            frame = frame.dropna(subset=["date"])
-            numeric_cols = ["open", "high", "low", "close", "volume"]
-            frame[numeric_cols] = frame[numeric_cols].apply(pd.to_numeric, errors="coerce")
-            frame = frame.dropna(subset=["close"]).set_index("date").sort_index()
-            frame["volume"] = frame["volume"].astype(float)
-            frame["adv_20"] = frame["volume"].rolling(20, min_periods=1).mean()
-            self._raw_stooq_cache[stooq_symbol] = frame.copy()
-            full_history = self._raw_stooq_cache[stooq_symbol]
+            return self._raw_stooq_cache[stooq_symbol]
+
+        response = self.session.get(self.STOOQ_URL, params={"s": stooq_symbol, "i": "d"}, timeout=10)
+        response.raise_for_status()
+        frame = pd.read_csv(io.StringIO(response.text))
+        if frame.empty or "Data" not in frame and "Date" not in frame:
+            raise ValueError("Empty Stooq response")
+
+        colmap = {
+            "Data": "date",
+            "Date": "date",
+            "Otwarcie": "open",
+            "Open": "open",
+            "Najwyzszy": "high",
+            "High": "high",
+            "Najnizszy": "low",
+            "Low": "low",
+            "Zamkniecie": "close",
+            "Close": "close",
+            "Wolumen": "volume",
+            "Volume": "volume",
+        }
+        frame = frame.rename(columns=colmap)
+        if "date" not in frame.columns or "close" not in frame.columns:
+            raise ValueError("Unexpected Stooq response columns")
+        frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+        frame = frame.dropna(subset=["date"])
+        numeric_cols = ["open", "high", "low", "close", "volume"]
+        frame[numeric_cols] = frame[numeric_cols].apply(pd.to_numeric, errors="coerce")
+        frame = frame.dropna(subset=["close"]).set_index("date").sort_index()
+        if frame.empty:
+            raise ValueError("No historical prices available")
+        frame["volume"] = frame["volume"].astype(float)
+        frame["adv_20"] = frame["volume"].rolling(20, min_periods=1).mean()
+        self._raw_stooq_cache[stooq_symbol] = frame.copy()
+        return self._raw_stooq_cache[stooq_symbol]
+
+    def _fetch_price_data_from_stooq(self, symbol: str, dates: pd.DatetimeIndex) -> pd.DataFrame:
+        full_history = self._load_stooq_history(symbol)
+        if full_history is None or full_history.empty:
+            raise ValueError("No historical prices available")
 
         frame = full_history.reindex(dates).copy()
         price_cols = ["open", "high", "low", "close"]
@@ -789,6 +810,8 @@ class DataFetcher:
         frame["volume"] = frame["volume"].astype(float)
         if "adv_20" not in frame.columns:
             frame["adv_20"] = frame["volume"].rolling(20, min_periods=1).mean()
+        if frame.empty:
+            raise ValueError("Requested window predates available price history")
         return frame[price_cols + ["volume", "adv_20"]]
 
     def _fetch_price_data_from_source(self, symbol: str, dates: pd.DatetimeIndex) -> pd.DataFrame:
@@ -2123,12 +2146,32 @@ class Backtester:
     """Simple daily rebalancing backtester for sanity checks."""
 
     def run(self, bot: "TradingBot", symbols: List[str], start: dt.date, end: dt.date) -> Dict[str, object]:
-        dates = pd.date_range(start, end, freq="B")
+        adjusted_start = start
+        data_fetcher = getattr(bot, "data_fetcher", None)
+        availability: List[dt.date] = []
+        if data_fetcher is not None:
+            for symbol in symbols:
+                try:
+                    earliest = data_fetcher.earliest_trading_day(symbol)
+                except Exception:
+                    logger.exception("availability_check_failed symbol=%s", symbol)
+                    earliest = None
+                if earliest is not None:
+                    availability.append(earliest)
+        if availability:
+            required_start = max([start, *availability])
+            if required_start > start:
+                logger.info(
+                    "adjusting_backtest_start original=%s adjusted=%s", start, required_start
+                )
+                adjusted_start = required_start
+
+        dates = pd.date_range(adjusted_start, end, freq="B")
         equity_points: List[Tuple[pd.Timestamp, float]] = []
         weights_history: List[Tuple[pd.Timestamp, Dict[str, float]]] = []
         for current_date in dates:
             analyses: List[Analysis] = []
-            if current_date.date() <= start:
+            if current_date.date() <= adjusted_start:
                 bot.end_of_day(current_date)
                 equity = bot.portfolio.total_equity(bot.latest_prices)
                 equity_points.append((current_date, equity))
@@ -2139,7 +2182,7 @@ class Backtester:
                 continue
             for symbol in symbols:
                 try:
-                    analyses.append(bot.analyze(symbol, start, current_date.date()))
+                    analyses.append(bot.analyze(symbol, adjusted_start, current_date.date()))
                 except Exception:
                     logger.exception("analysis_failed symbol=%s as_of=%s", symbol, current_date)
             try:
@@ -2183,7 +2226,7 @@ class Backtester:
         if persist and output_dir is not None:
             summary_payload = {
                 "symbols": symbols,
-                "start": str(start),
+                "start": str(adjusted_start),
                 "end": str(end),
                 "sharpe": sharpe,
                 "max_drawdown": drawdown,
@@ -2196,6 +2239,7 @@ class Backtester:
             "sharpe": sharpe,
             "max_drawdown": drawdown,
             "artifact_path": output_dir,
+            "start": adjusted_start,
         }
 
 
