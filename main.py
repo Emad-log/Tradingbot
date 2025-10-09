@@ -2265,6 +2265,7 @@ class Backtester:
         else:
             sharpe = float(returns.mean() / (returns.std() + 1e-12) * math.sqrt(252))
         drawdown = float((curve / curve.cummax() - 1.0).min()) if not curve.empty else float("nan")
+        total_return = float(curve.iloc[-1] / curve.iloc[0] - 1.0) if len(curve) >= 2 else float("nan")
         persist = getattr(config, "persist_backtest_artifacts", False)
         output_dir: Optional[Path] = None
         if persist:
@@ -2288,6 +2289,7 @@ class Backtester:
                 "end": str(end),
                 "sharpe": sharpe,
                 "max_drawdown": drawdown,
+                "total_return": total_return,
                 "average_turnover": avg_turnover,
             }
             (output_dir / "summary.json").write_text(json.dumps(summary_payload, indent=2))
@@ -2298,6 +2300,7 @@ class Backtester:
             "max_drawdown": drawdown,
             "artifact_path": output_dir,
             "start": adjusted_start,
+            "total_return": total_return,
         }
 
 
@@ -3099,9 +3102,10 @@ def main() -> None:
         )
         results = Backtester().run(bot, symbols, start_date, end_date)
         logger.info(
-            "backtest_result sharpe=%.3f max_drawdown=%.2f%% final_equity=%s",
+            "backtest_result sharpe=%.3f max_drawdown=%.2f%% total_return=%.2f%% final_equity=%s",
             results.get("sharpe", float("nan")),
             100 * results.get("max_drawdown", float("nan")),
+            100 * results.get("total_return", float("nan")),
             ("$%.2f" % results["equity"].iloc[-1]) if not results.get("equity", pd.Series(dtype=float)).empty else "n/a",
         )
         artifact_path = results.get("artifact_path")
@@ -3114,6 +3118,7 @@ def main() -> None:
                 "end": str(end_date),
                 "sharpe": results.get("sharpe"),
                 "max_drawdown": results.get("max_drawdown"),
+                "total_return": results.get("total_return"),
                 "artifact_path": str(artifact_path) if artifact_path else None,
             }
             output_path = Path(args.json_out)
