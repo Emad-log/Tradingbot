@@ -71,6 +71,7 @@ class TradingConfig:
     laplacian_k: int = 5
     persist_backtest_artifacts: bool = False
     backtest_artifacts_root: str = "runs"
+    fast_backtest: bool = False
 
 
 @dataclass
@@ -282,6 +283,11 @@ class RepresentationLearningEngine:
             else:
                 aligned_embeddings = news_embeddings.reindex(feature_frame.index).fillna(0.0)
             return RepresentationLearningResult(feature_frame, target, pd.Series(dtype=float), aligned_embeddings)
+
+        if getattr(self.config, "fast_backtest", False):
+            aligned_embeddings = news_embeddings.reindex(feature_frame.index).fillna(0.0)
+            predictions = pd.Series(0.0, index=feature_frame.index)
+            return RepresentationLearningResult(feature_frame, target, predictions, aligned_embeddings)
 
         X = feature_frame.values
         y = target.values
@@ -665,7 +671,8 @@ class MacroEnvironment:
 class DataFetcher:
     """Fetches price, news, and macro data from freely accessible sources."""
 
-    STOOQ_URL = "https://stooq.pl/q/d/l/"
+    STOOQ_URL = "https://stooq.com/q/d/l/"
+    STOOQ_FALLBACK_URL = "https://stooq.pl/q/d/l/"
     YAHOO_RSS_URL = "https://feeds.finance.yahoo.com/rss/2.0/headline"
     WSJ_MARKETS_FEED = "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"
     WORLD_BANK_URL = "https://api.worldbank.org/v2/country/{country}/indicator/{indicator}"
@@ -711,6 +718,10 @@ class DataFetcher:
         self._price_cache: Dict[Tuple[str, dt.date, dt.date], pd.DataFrame] = {}
         self._raw_stooq_cache: Dict[str, pd.DataFrame] = {}
         self._fred_cache: Dict[str, pd.DataFrame] = {}
+        self._macro_news_cache: Optional[List[Dict[str, str]]] = None
+        self._symbol_news_cache: Dict[str, List[Dict[str, str]]] = {}
+        self._world_bank_cache: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
+        self._macro_snapshot_cache: Dict[dt.date, MacroSnapshot] = {}
 
     def fetch_price_data(self, symbol: str, start: dt.date, end: dt.date) -> pd.DataFrame:
         if start >= end:
@@ -760,8 +771,17 @@ class DataFetcher:
         if stooq_symbol in self._raw_stooq_cache:
             return self._raw_stooq_cache[stooq_symbol]
 
-        response = self.session.get(self.STOOQ_URL, params={"s": stooq_symbol, "i": "d"}, timeout=10)
-        response.raise_for_status()
+        try:
+            response = self.session.get(self.STOOQ_URL, params={"s": stooq_symbol, "i": "d"}, timeout=10)
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status == 400 and self.STOOQ_FALLBACK_URL:
+                alt = self.session.get(self.STOOQ_FALLBACK_URL, params={"s": stooq_symbol, "i": "d"}, timeout=10)
+                alt.raise_for_status()
+                response = alt
+            else:
+                raise
         frame = pd.read_csv(io.StringIO(response.text))
         if frame.empty or "Data" not in frame and "Date" not in frame:
             raise ValueError("Empty Stooq response")
@@ -853,8 +873,27 @@ class DataFetcher:
         if self.offline:
             return self._generate_synthetic_news(symbol, as_of=as_of)
         try:
-            macro_news = self._fetch_macro_news()
-            industry_news = self._fetch_symbol_news(symbol)
+            if self._macro_news_cache is None:
+                try:
+                    macro_news = self._fetch_macro_news()
+                except Exception as exc:  # pragma: no cover - network branch
+                    logger.warning("Falling back to cached macro news due to %s", exc)
+                    macro_news = []
+                self._macro_news_cache = list(macro_news)
+            else:
+                macro_news = list(self._macro_news_cache)
+
+            key = symbol.upper()
+            if key not in self._symbol_news_cache:
+                try:
+                    industry_news = self._fetch_symbol_news(symbol)
+                except Exception as exc:  # pragma: no cover - network branch
+                    logger.warning("Falling back to synthetic news for %s due to %s", symbol, exc)
+                    industry_news = []
+                self._symbol_news_cache[key] = list(industry_news)
+            else:
+                industry_news = list(self._symbol_news_cache[key])
+
             news_items = macro_news + industry_news
             if as_of is not None:
                 tz = getattr(self, "market_tz", "America/New_York")
@@ -877,7 +916,11 @@ class DataFetcher:
             return news_items
         except Exception as exc:  # pragma: no cover - network branch
             logger.warning("Falling back to synthetic news for %s due to %s", symbol, exc)
-            return self._generate_synthetic_news(symbol, as_of=as_of)
+            fallback = self._generate_synthetic_news(symbol, as_of=as_of)
+            self._symbol_news_cache[symbol.upper()] = list(fallback)
+            if self._macro_news_cache is None:
+                self._macro_news_cache = []
+            return fallback
 
     def _fetch_symbol_news(self, symbol: str, limit: int = 12) -> List[Dict[str, str]]:
         if self.news_source != "rss":
@@ -1013,6 +1056,11 @@ class DataFetcher:
             return self._generate_synthetic_macro(as_of)
 
     def _fetch_macro_snapshot_from_sources_asof(self, as_of: dt.date) -> MacroSnapshot:
+        month_key = as_of.replace(day=1)
+        cached = self._macro_snapshot_cache.get(month_key)
+        if cached is not None:
+            return cached
+
         gdp_growth = self._world_bank_asof("USA", "NY.GDP.MKTP.KD.ZG", as_of) / 100.0
         world_growth = self._world_bank_asof("WLD", "NY.GDP.MKTP.KD.ZG", as_of) / 100.0
         inflation = self._world_bank_asof("USA", "FP.CPI.TOTL.ZG", as_of) / 100.0
@@ -1031,7 +1079,7 @@ class DataFetcher:
         housing_yoy = self._compute_yoy_growth_asof(self._fetch_fred_series("HOUST"), as_of)
         consumer_sentiment = self._fred_latest_asof("UMCSENT", as_of)
 
-        return MacroSnapshot(
+        snapshot = MacroSnapshot(
             gdp_growth=float(gdp_growth),
             inflation=float(inflation),
             unemployment=float(max(unemployment, 0.02)),
@@ -1045,15 +1093,21 @@ class DataFetcher:
             consumer_sentiment_index=float(consumer_sentiment),
             global_growth_diff=float(gdp_growth - world_growth),
         )
+        self._macro_snapshot_cache[month_key] = snapshot
+        return snapshot
 
     def _world_bank_asof(self, country: str, indicator: str, as_of: dt.date) -> float:
         url = self.WORLD_BANK_URL.format(country=country, indicator=indicator)
-        response = self.session.get(url, params={"format": "json", "per_page": 60}, timeout=10)
-        response.raise_for_status()
-        payload = response.json()
-        if len(payload) < 2:
-            raise ValueError("Unexpected World Bank response")
-        series = payload[1]
+        cache_key = (country, indicator)
+        series = self._world_bank_cache.get(cache_key)
+        if series is None:
+            response = self.session.get(url, params={"format": "json", "per_page": 60}, timeout=10)
+            response.raise_for_status()
+            payload = response.json()
+            if len(payload) < 2:
+                raise ValueError("Unexpected World Bank response")
+            series = payload[1]
+            self._world_bank_cache[cache_key] = series
         cutoff_year = as_of.year
 
         def _entry_year(entry: Dict[str, object]) -> int:
@@ -2094,7 +2148,7 @@ def build_cluster_exposures(returns: pd.DataFrame, n_clusters: int) -> Optional[
     if returns.empty or returns.shape[1] < 2:
         return None
     n_assets = returns.shape[1]
-    n_clusters = min(n_clusters, n_assets)
+    n_clusters = min(n_clusters, max(2, n_assets - 1))
     if n_clusters < 2:
         return None
     corr = returns.corr().fillna(0.0).abs().values
@@ -2167,6 +2221,11 @@ class Backtester:
                 adjusted_start = required_start
 
         dates = pd.date_range(adjusted_start, end, freq="B")
+        config = getattr(bot, "config", None)
+        fast_mode = bool(getattr(config, "fast_backtest", False))
+        if fast_mode and len(dates) > 0:
+            monthly = pd.DatetimeIndex(sorted({dates[0], dates[-1], *dates[dates.is_month_start]}))
+            dates = monthly
         equity_points: List[Tuple[pd.Timestamp, float]] = []
         weights_history: List[Tuple[pd.Timestamp, Dict[str, float]]] = []
         for current_date in dates:
@@ -2206,7 +2265,6 @@ class Backtester:
         else:
             sharpe = float(returns.mean() / (returns.std() + 1e-12) * math.sqrt(252))
         drawdown = float((curve / curve.cummax() - 1.0).min()) if not curve.empty else float("nan")
-        config = getattr(bot, "config", None)
         persist = getattr(config, "persist_backtest_artifacts", False)
         output_dir: Optional[Path] = None
         if persist:
@@ -3001,6 +3059,11 @@ def main() -> None:
     parser.add_argument("--model-type", choices=["logistic", "neural"], default=defaults.model_type, help="Prediction model type")
     parser.add_argument("--no-calibration", action="store_true", help="Disable probability calibration for logistic model")
     parser.add_argument("--json-out", type=str, help="Write JSON output to this path")
+    parser.add_argument(
+        "--fast-backtest",
+        action="store_true",
+        help="Only rebalance on month starts to speed up long simulations",
+    )
     args = parser.parse_args()
 
     if not logging.getLogger().handlers:
@@ -3026,6 +3089,7 @@ def main() -> None:
         initial_cash=args.initial_cash,
         model_type=args.model_type,
         use_calibration=not args.no_calibration,
+        fast_backtest=args.fast_backtest,
     )
     bot = TradingBot(config=config)
 
